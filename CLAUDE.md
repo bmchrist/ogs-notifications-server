@@ -86,12 +86,20 @@ The server sends notifications with this structure:
 ```json
 {
   "aps": {
-    "alert": "You have a new turn in Go Game!" // or "You have X new turns in Go games!"
+    "alert": "[dev] It's your turn in: Game Name" // Environment prefix in body
   },
   "web_url": "https://online-go.com/game/12345678",
-  "app_url": "ogs://game/12345678"
+  "app_url": "ogs://game/12345678",
+  "game_id": 12345678,
+  "action": "open_game",
+  "game_name": "Game Name"
 }
 ```
+
+**Environment in Notification Body:**
+- Development: `[dev] It's your turn in: Game Name`
+- Production: `It's your turn in: Game Name` (no prefix if environment is "none")
+- Custom: `[staging] It's your turn in 3 games`
 
 ## iOS App Requirements
 

@@ -41,6 +41,7 @@ A Go server that monitors [Online-Go.com](https://online-go.com) games and sends
    - `APNS_BUNDLE_ID`: Your iOS app's bundle identifier
    - `APNS_DEVELOPMENT`: Set to `true` for development, `false` for production
    - `CHECK_INTERVAL_MINUTES`: How often to check for new turns (default: 3)
+   - `ENVIRONMENT`: Deployment environment name (optional, defaults to "none")
 
 ### Running the Server
 
@@ -76,6 +77,14 @@ GET /check/:user_id
 ```
 
 Returns JSON with current game status and sends notifications if needed.
+
+### User Diagnostics
+
+```bash
+GET /diagnostics/:user_id
+```
+
+Returns comprehensive user status including device registration, monitored games, and last notification time.
 
 ## Getting Your OGS User ID
 

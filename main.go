@@ -25,16 +25,9 @@ func min(a, b int) int {
 }
 
 type Game struct {
-	ID    int       `json:"id"`
-	Name  string    `json:"name"`
-	Black Player    `json:"black"`
-	White Player    `json:"white"`
-	JSON  GameState `json:"json"`
-}
-
-type Player struct {
-	ID       int    `json:"id"`
-	Username string `json:"username"`
+	ID   int       `json:"id"`
+	Name string    `json:"name"`
+	JSON GameState `json:"json"`
 }
 
 type GameState struct {
@@ -56,10 +49,6 @@ type TurnStatus struct {
 	YourTurnOld  []int `json:"your_turn_old"`
 }
 
-type GameMove struct {
-	GameID   int   `json:"game_id"`
-	LastMove int64 `json:"last_move"`
-}
 
 type MoveStorage struct {
 	mu                   sync.RWMutex
@@ -98,11 +87,6 @@ type UserDiagnostics struct {
 	LastServerCheckTime      int64            `json:"last_server_check_time"`
 }
 
-type TestNotificationRequest struct {
-	DeviceToken string `json:"device_token"`
-	Title       string `json:"title,omitempty"`
-	Body        string `json:"body,omitempty"`
-}
 
 var apnsClient *apns2.Client
 
@@ -117,7 +101,6 @@ func main() {
 
 	r.HandleFunc("/check/{userID}", checkUserTurn).Methods("GET")
 	r.HandleFunc("/register", registerDevice).Methods("POST")
-	r.HandleFunc("/test-notification", testNotification).Methods("POST")
 	r.HandleFunc("/health", healthCheck).Methods("GET")
 	r.HandleFunc("/diagnostics/{userID}", getUserDiagnostics).Methods("GET")
 
@@ -173,27 +156,21 @@ func getUserTurnStatus(userID int) (*TurnStatus, error) {
 	var newTurnGames []Game
 
 	for _, game := range games {
-		log.Printf("Analyzing game %d: current_player=%d, last_move=%d",
-			game.ID, game.JSON.Clock.CurrentPlayer, game.JSON.Clock.LastMove)
 
 		if game.JSON.Clock.CurrentPlayer == userID {
 			// Check if this is a new turn vs old turn
 			isNew := isNewTurn(userIDStr, game.ID, game.JSON.Clock.LastMove)
-			log.Printf("Game %d: Your turn (new=%t)", game.ID, isNew)
 
 			if isNew {
 				status.YourTurnNew = append(status.YourTurnNew, game.ID)
 				newTurnGames = append(newTurnGames, game)
 				// Update stored move for new turns
 				updateStoredMove(userIDStr, game.ID, game.JSON.Clock.LastMove)
-				log.Printf("Game %d added to new turns list", game.ID)
 			} else {
 				status.YourTurnOld = append(status.YourTurnOld, game.ID)
-				log.Printf("Game %d is an old turn", game.ID)
 			}
 		} else {
 			status.NotYourTurn = append(status.NotYourTurn, game.ID)
-			log.Printf("Game %d: Not your turn (current_player=%d)", game.ID, game.JSON.Clock.CurrentPlayer)
 		}
 	}
 
@@ -376,7 +353,6 @@ func initAPNS() {
 }
 
 func registerDevice(w http.ResponseWriter, r *http.Request) {
-	log.Printf("Registration request received from %s", r.RemoteAddr)
 
 	var registration DeviceRegistration
 	if err := json.NewDecoder(r.Body).Decode(&registration); err != nil {
@@ -406,72 +382,6 @@ func registerDevice(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]string{"status": "registered"})
 }
 
-func testNotification(w http.ResponseWriter, r *http.Request) {
-	var req TestNotificationRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "Invalid JSON", http.StatusBadRequest)
-		return
-	}
-
-	if req.DeviceToken == "" {
-		http.Error(w, "device_token is required", http.StatusBadRequest)
-		return
-	}
-
-	if apnsClient == nil {
-		http.Error(w, "APNs client not initialized. Check certificate configuration.", http.StatusServiceUnavailable)
-		return
-	}
-
-	// Set default values if not provided
-	title := req.Title
-	if title == "" {
-		title = "Test Notification"
-	}
-
-	body := req.Body
-	if body == "" {
-		body = "This is a test push notification from your Go server!"
-	}
-
-	// Create notification payload
-	notification := &apns2.Notification{}
-	notification.DeviceToken = req.DeviceToken
-	notification.Topic = os.Getenv("APNS_BUNDLE_ID")
-
-	payload := payload.NewPayload().Alert(title).
-		AlertBody(body).
-		Badge(1).
-		Sound("default")
-
-	notification.Payload = payload
-
-	// Send the notification
-	res, err := apnsClient.Push(notification)
-	if err != nil {
-		log.Printf("Error sending test notification: %v", err)
-		http.Error(w, fmt.Sprintf("Failed to send notification: %v", err), http.StatusInternalServerError)
-		return
-	}
-
-	response := map[string]interface{}{
-		"success":     res.Sent(),
-		"status_code": res.StatusCode,
-		"apns_id":     res.ApnsID,
-	}
-
-	if res.Sent() {
-		log.Printf("Test notification sent successfully. APNs ID: %s", res.ApnsID)
-		response["message"] = "Notification sent successfully"
-	} else {
-		log.Printf("Test notification failed: %v", res.Reason)
-		response["reason"] = res.Reason
-		response["message"] = "Notification failed"
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(response)
-}
 
 func getUserDiagnostics(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
@@ -559,14 +469,29 @@ func sendConsolidatedPushNotification(userID string, newTurnGames []Game) {
 
 	log.Printf("Found device token for user %s (token: %s...)", userID, deviceToken[:min(16, len(deviceToken))])
 
+	// Get environment name (defaults to "none" if not set)
+	environment := os.Getenv("ENVIRONMENT")
+	log.Printf("Environment: %s", environment)
+	if environment == "" {
+		environment = "none"
+	}
+
 	// Create notification title and body based on number of games
 	var title, body string
 	if len(newTurnGames) == 1 {
 		title = "Your turn in Go!"
-		body = fmt.Sprintf("It's your turn in: %s", newTurnGames[0].Name)
+		if environment != "none" {
+			body = fmt.Sprintf("[%s] It's your turn in: %s", environment, newTurnGames[0].Name)
+		} else {
+			body = fmt.Sprintf("It's your turn in: %s", newTurnGames[0].Name)
+		}
 	} else {
 		title = "Your turn in Go!"
-		body = fmt.Sprintf("It's your turn in %d games", len(newTurnGames))
+		if environment != "none" {
+			body = fmt.Sprintf("[%s] It's your turn in %d games", environment, len(newTurnGames))
+		} else {
+			body = fmt.Sprintf("It's your turn in %d games", len(newTurnGames))
+		}
 	}
 
 	// Use the first game for the deep link
@@ -614,47 +539,6 @@ func sendConsolidatedPushNotification(userID string, newTurnGames []Game) {
 	}
 }
 
-func sendPushNotification(userID, gameName string) {
-	// Legacy function - keeping for backward compatibility with test endpoint
-	if apnsClient == nil {
-		log.Printf("APNs client not initialized, skipping push notification for user %s", userID)
-		return
-	}
-
-	storage.mu.RLock()
-	deviceToken, exists := storage.deviceTokens[userID]
-	storage.mu.RUnlock()
-
-	if !exists {
-		log.Printf("No device token found for user %s", userID)
-		return
-	}
-
-	// Create notification payload
-	notification := &apns2.Notification{}
-	notification.DeviceToken = deviceToken
-	notification.Topic = os.Getenv("APNS_BUNDLE_ID")
-
-	payload := payload.NewPayload().Alert("Your turn in Go!").
-		AlertBody(fmt.Sprintf("It's your turn in: %s", gameName)).
-		Badge(1).
-		Sound("default")
-
-	notification.Payload = payload
-
-	// Send the notification
-	res, err := apnsClient.Push(notification)
-	if err != nil {
-		log.Printf("Error sending push notification to user %s: %v", userID, err)
-		return
-	}
-
-	if res.Sent() {
-		log.Printf("Push notification sent successfully to user %s for game: %s", userID, gameName)
-	} else {
-		log.Printf("Push notification failed for user %s: %v", userID, res.Reason)
-	}
-}
 
 func startPeriodicChecking() {
 	// Get check interval from environment, default to 30 seconds
@@ -698,7 +582,6 @@ func checkAllUsers() {
 	log.Printf("Checking turns for %d registered users", len(deviceTokens))
 
 	for userIDStr := range deviceTokens {
-		log.Printf("Checking user %s...", userIDStr)
 
 		userID, err := strconv.Atoi(userIDStr)
 		if err != nil {
