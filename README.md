@@ -1,0 +1,139 @@
+# OGS Notifications Server
+
+A Go server that monitors [Online-Go.com](https://online-go.com) games and sends iOS push notifications when it's your turn to play.
+
+## Features
+
+- **Automatic Turn Monitoring**: Continuously checks your OGS games every few minutes
+- **iOS Push Notifications**: Sends consolidated notifications when new turns are detected
+- **Deep Linking**: Notifications include both web URLs and iOS app URLs for seamless game access
+- **Smart Notifications**: Combines multiple new turns into a single notification to avoid spam
+- **Persistent Tracking**: Remembers which moves you've already been notified about
+
+## Quick Start
+
+### Prerequisites
+
+- Go 1.19 or later
+- Apple Developer account with push notification capabilities
+- APNs authentication key (.p8 file) from Apple Developer portal
+
+### Setup
+
+1. **Clone and build:**
+   ```bash
+   git clone <repository-url>
+   cd ogs-notifications-server
+   go mod download
+   go build -o ogs-server
+   ```
+
+2. **Configure environment variables:**
+   ```bash
+   cp .env.example .env
+   # Edit .env with your APNs credentials
+   ```
+
+3. **Required environment variables:**
+   - `APNS_KEY_PATH`: Path to your .p8 authentication key file
+   - `APNS_KEY_ID`: Your APNs key ID (10 characters)
+   - `APNS_TEAM_ID`: Your Apple Developer team ID (10 characters)
+   - `APNS_BUNDLE_ID`: Your iOS app's bundle identifier
+   - `APNS_DEVELOPMENT`: Set to `true` for development, `false` for production
+   - `CHECK_INTERVAL_MINUTES`: How often to check for new turns (default: 3)
+
+### Running the Server
+
+```bash
+# Load environment and start server
+source .env
+./ogs-server
+```
+
+The server will:
+- Start on port 8080
+- Begin checking all registered users every few minutes
+- Send push notifications automatically when new turns are detected
+
+## API Endpoints
+
+### Register a Device Token
+
+```bash
+POST /register/:user_id
+Content-Type: application/json
+
+{
+  "device_token": "your_ios_device_token_here"
+}
+```
+
+### Manual Turn Check (Optional)
+
+```bash
+GET /check/:user_id
+```
+
+Returns JSON with current game status and sends notifications if needed.
+
+## Getting Your OGS User ID
+
+1. Go to your profile on [Online-Go.com](https://online-go.com)
+2. Your user ID is the number in the URL: `https://online-go.com/user/view/YOUR_ID_HERE`
+
+## Getting APNs Credentials
+
+1. Log into [Apple Developer portal](https://developer.apple.com)
+2. Go to Certificates, Identifiers & Profiles
+3. Create an APNs authentication key (.p8 file)
+4. Note your Key ID and Team ID for configuration
+
+## Notification Behavior
+
+- **Single Game**: "You have a new turn in Go Game!"
+- **Multiple Games**: "You have 3 new turns in Go games!"
+- Each notification includes a deep link to one of the games
+- Only sends notifications for newly detected turns (not existing ones)
+
+## Storage
+
+The server uses `moves.json` to persist:
+- Move timestamps for each user's games (prevents duplicate notifications)
+- Device token registrations
+
+## Troubleshooting
+
+### "MissingProviderToken" Error
+- Ensure you're using .p8 token authentication (not .p12 certificates)
+- Verify your bundle ID matches your iOS app exactly
+
+### No Notifications Received
+- Check that your device token is correctly registered
+- Verify APNs credentials are valid
+- Ensure your iOS app has push notification permissions
+
+### Port Already in Use
+```bash
+# Kill existing server instances
+pkill -f ogs-server
+```
+
+## Development
+
+### Testing with Shorter Intervals
+```bash
+CHECK_INTERVAL_MINUTES=1 ./ogs-server
+```
+
+### Manual Testing
+```bash
+curl -X POST http://localhost:8080/register/YOUR_USER_ID \
+  -H "Content-Type: application/json" \
+  -d '{"device_token": "YOUR_DEVICE_TOKEN"}'
+
+curl http://localhost:8080/check/YOUR_USER_ID
+```
+
+## License
+
+MIT License - see LICENSE file for details.

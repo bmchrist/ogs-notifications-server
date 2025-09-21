@@ -17,6 +17,13 @@ import (
 	"github.com/sideshow/apns2/token"
 )
 
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
 type Game struct {
 	ID    int       `json:"id"`
 	Name  string    `json:"name"`
@@ -82,6 +89,9 @@ func main() {
 	loadStorage()
 	initAPNS()
 
+	// Start periodic checking in background
+	go startPeriodicChecking()
+
 	r := mux.NewRouter()
 
 	r.HandleFunc("/check/{userID}", checkUserTurn).Methods("GET")
@@ -90,6 +100,7 @@ func main() {
 	r.HandleFunc("/health", healthCheck).Methods("GET")
 
 	log.Println("Server starting on :8080")
+	log.Println("Automatic turn checking enabled")
 	log.Fatal(http.ListenAndServe(":8080", r))
 }
 
@@ -119,10 +130,15 @@ func checkUserTurn(w http.ResponseWriter, r *http.Request) {
 }
 
 func getUserTurnStatus(userID int) (*TurnStatus, error) {
+	log.Printf("Fetching turn status for user %d", userID)
+
 	games, err := getActiveGames(userID)
 	if err != nil {
+		log.Printf("Failed to get active games for user %d: %v", userID, err)
 		return nil, err
 	}
+
+	log.Printf("User %d has %d active games", userID, len(games))
 
 	status := &TurnStatus{
 		NotYourTurn: []int{},
@@ -135,18 +151,27 @@ func getUserTurnStatus(userID int) (*TurnStatus, error) {
 	var newTurnGames []Game
 
 	for _, game := range games {
+		log.Printf("Analyzing game %d: current_player=%d, last_move=%d",
+			game.ID, game.JSON.Clock.CurrentPlayer, game.JSON.Clock.LastMove)
+
 		if game.JSON.Clock.CurrentPlayer == userID {
 			// Check if this is a new turn vs old turn
-			if isNewTurn(userIDStr, game.ID, game.JSON.Clock.LastMove) {
+			isNew := isNewTurn(userIDStr, game.ID, game.JSON.Clock.LastMove)
+			log.Printf("Game %d: Your turn (new=%t)", game.ID, isNew)
+
+			if isNew {
 				status.YourTurnNew = append(status.YourTurnNew, game.ID)
 				newTurnGames = append(newTurnGames, game)
 				// Update stored move for new turns
 				updateStoredMove(userIDStr, game.ID, game.JSON.Clock.LastMove)
+				log.Printf("Game %d added to new turns list", game.ID)
 			} else {
 				status.YourTurnOld = append(status.YourTurnOld, game.ID)
+				log.Printf("Game %d is an old turn", game.ID)
 			}
 		} else {
 			status.NotYourTurn = append(status.NotYourTurn, game.ID)
+			log.Printf("Game %d: Not your turn (current_player=%d)", game.ID, game.JSON.Clock.CurrentPlayer)
 		}
 	}
 
@@ -161,15 +186,20 @@ func getUserTurnStatus(userID int) (*TurnStatus, error) {
 
 func getActiveGames(userID int) ([]Game, error) {
 	url := fmt.Sprintf("https://online-go.com/api/v1/players/%d/full", userID)
+	log.Printf("Making OGS API request: %s", url)
 
 	client := &http.Client{Timeout: 10 * time.Second}
 	resp, err := client.Get(url)
 	if err != nil {
+		log.Printf("OGS API request failed: %v", err)
 		return nil, fmt.Errorf("failed to fetch games: %v", err)
 	}
 	defer resp.Body.Close()
 
+	log.Printf("OGS API response status: %d", resp.StatusCode)
+
 	if resp.StatusCode != http.StatusOK {
+		log.Printf("OGS API returned non-200 status: %d", resp.StatusCode)
 		return nil, fmt.Errorf("API returned status %d", resp.StatusCode)
 	}
 
@@ -217,9 +247,13 @@ func loadStorage() {
 	storage.mu.Lock()
 	defer storage.mu.Unlock()
 
+	log.Println("Loading storage from moves.json...")
+
 	data, err := os.ReadFile("moves.json")
 	if err != nil {
 		log.Println("No existing moves.json file, starting fresh")
+		storage.moves = make(map[string]map[int]int64)
+		storage.deviceTokens = make(map[string]string)
 		return
 	}
 
@@ -233,6 +267,8 @@ func loadStorage() {
 		storage.moves = storageData.Moves
 		if storageData.DeviceTokens != nil {
 			storage.deviceTokens = storageData.DeviceTokens
+			log.Printf("Loaded storage: %d users with device tokens, %d users with move history",
+				len(storage.deviceTokens), len(storage.moves))
 		}
 		return
 	}
@@ -265,6 +301,9 @@ func saveStorage() {
 
 	if err := os.WriteFile("moves.json", data, 0644); err != nil {
 		log.Printf("Error saving moves.json: %v", err)
+	} else {
+		log.Printf("Storage saved: %d users with device tokens, %d users with move history",
+			len(storage.deviceTokens), len(storage.moves))
 	}
 }
 
@@ -307,22 +346,31 @@ func initAPNS() {
 }
 
 func registerDevice(w http.ResponseWriter, r *http.Request) {
+	log.Printf("Registration request received from %s", r.RemoteAddr)
+
 	var registration DeviceRegistration
 	if err := json.NewDecoder(r.Body).Decode(&registration); err != nil {
+		log.Printf("Registration failed: Invalid JSON from %s - %v", r.RemoteAddr, err)
 		http.Error(w, "Invalid JSON", http.StatusBadRequest)
 		return
 	}
 
 	if registration.UserID == "" || registration.DeviceToken == "" {
+		log.Printf("Registration failed: Missing required fields (user_id=%s, token_length=%d)",
+			registration.UserID, len(registration.DeviceToken))
 		http.Error(w, "user_id and device_token are required", http.StatusBadRequest)
 		return
 	}
+
+	log.Printf("Registering device for user %s (token: %s...)",
+		registration.UserID, registration.DeviceToken[:min(16, len(registration.DeviceToken))])
 
 	storage.mu.Lock()
 	storage.deviceTokens[registration.UserID] = registration.DeviceToken
 	storage.mu.Unlock()
 
 	saveStorage()
+	log.Printf("Successfully registered device for user %s", registration.UserID)
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"status": "registered"})
@@ -396,6 +444,8 @@ func testNotification(w http.ResponseWriter, r *http.Request) {
 }
 
 func sendConsolidatedPushNotification(userID string, newTurnGames []Game) {
+	log.Printf("Preparing push notification for user %s with %d new turn games", userID, len(newTurnGames))
+
 	if apnsClient == nil {
 		log.Printf("APNs client not initialized, skipping push notification for user %s", userID)
 		return
@@ -411,8 +461,11 @@ func sendConsolidatedPushNotification(userID string, newTurnGames []Game) {
 	}
 
 	if len(newTurnGames) == 0 {
+		log.Printf("No new turn games for user %s, skipping notification", userID)
 		return
 	}
+
+	log.Printf("Found device token for user %s (token: %s...)", userID, deviceToken[:min(16, len(deviceToken))])
 
 	// Create notification title and body based on number of games
 	var title, body string
@@ -502,5 +555,77 @@ func sendPushNotification(userID, gameName string) {
 	} else {
 		log.Printf("Push notification failed for user %s: %v", userID, res.Reason)
 	}
+}
+
+func startPeriodicChecking() {
+	// Get check interval from environment, default to 30 seconds
+	checkInterval := 30 * time.Second
+
+	// Support both seconds and minutes for flexibility
+	if intervalStr := os.Getenv("CHECK_INTERVAL_SECONDS"); intervalStr != "" {
+		if interval, err := strconv.Atoi(intervalStr); err == nil {
+			checkInterval = time.Duration(interval) * time.Second
+		}
+	} else if intervalStr := os.Getenv("CHECK_INTERVAL_MINUTES"); intervalStr != "" {
+		if interval, err := strconv.Atoi(intervalStr); err == nil {
+			checkInterval = time.Duration(interval) * time.Minute
+		}
+	}
+
+	log.Printf("Starting periodic turn checking every %v", checkInterval)
+
+	ticker := time.NewTicker(checkInterval)
+	defer ticker.Stop()
+
+	// Run initial check after 5 seconds
+	time.Sleep(5 * time.Second)
+	checkAllUsers()
+
+	// Then run on schedule
+	for range ticker.C {
+		checkAllUsers()
+	}
+}
+
+func checkAllUsers() {
+	storage.mu.RLock()
+	deviceTokens := make(map[string]string)
+	for userID, token := range storage.deviceTokens {
+		deviceTokens[userID] = token
+	}
+	storage.mu.RUnlock()
+
+	if len(deviceTokens) == 0 {
+		log.Println("No registered users to check")
+		return
+	}
+
+	log.Printf("Checking turns for %d registered users", len(deviceTokens))
+
+	for userIDStr := range deviceTokens {
+		log.Printf("Checking user %s...", userIDStr)
+
+		userID, err := strconv.Atoi(userIDStr)
+		if err != nil {
+			log.Printf("Invalid user ID: %s", userIDStr)
+			continue
+		}
+
+		// Use the existing getUserTurnStatus function which handles notifications
+		status, err := getUserTurnStatus(userID)
+		if err != nil {
+			log.Printf("Error checking user %s: %v", userIDStr, err)
+			continue
+		}
+
+		log.Printf("User %s status: %d not_your_turn, %d your_turn_new, %d your_turn_old",
+			userIDStr, len(status.NotYourTurn), len(status.YourTurnNew), len(status.YourTurnOld))
+
+		if len(status.YourTurnNew) > 0 {
+			log.Printf("User %s has %d new turns - notification should be sent", userIDStr, len(status.YourTurnNew))
+		}
+	}
+
+	log.Println("Turn checking cycle complete")
 }
 
