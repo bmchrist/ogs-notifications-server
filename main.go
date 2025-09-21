@@ -132,21 +132,27 @@ func getUserTurnStatus(userID int) (*TurnStatus, error) {
 
 	userIDStr := strconv.Itoa(userID)
 
+	var newTurnGames []Game
+
 	for _, game := range games {
 		if game.JSON.Clock.CurrentPlayer == userID {
 			// Check if this is a new turn vs old turn
 			if isNewTurn(userIDStr, game.ID, game.JSON.Clock.LastMove) {
 				status.YourTurnNew = append(status.YourTurnNew, game.ID)
+				newTurnGames = append(newTurnGames, game)
 				// Update stored move for new turns
 				updateStoredMove(userIDStr, game.ID, game.JSON.Clock.LastMove)
-				// Send push notification for new turn
-				go sendPushNotification(userIDStr, game.Name)
 			} else {
 				status.YourTurnOld = append(status.YourTurnOld, game.ID)
 			}
 		} else {
 			status.NotYourTurn = append(status.NotYourTurn, game.ID)
 		}
+	}
+
+	// Send single consolidated push notification if there are new turns
+	if len(newTurnGames) > 0 {
+		go sendConsolidatedPushNotification(userIDStr, newTurnGames)
 	}
 
 	saveStorage()
@@ -389,7 +395,75 @@ func testNotification(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(response)
 }
 
+func sendConsolidatedPushNotification(userID string, newTurnGames []Game) {
+	if apnsClient == nil {
+		log.Printf("APNs client not initialized, skipping push notification for user %s", userID)
+		return
+	}
+
+	storage.mu.RLock()
+	deviceToken, exists := storage.deviceTokens[userID]
+	storage.mu.RUnlock()
+
+	if !exists {
+		log.Printf("No device token found for user %s", userID)
+		return
+	}
+
+	if len(newTurnGames) == 0 {
+		return
+	}
+
+	// Create notification title and body based on number of games
+	var title, body string
+	if len(newTurnGames) == 1 {
+		title = "Your turn in Go!"
+		body = fmt.Sprintf("It's your turn in: %s", newTurnGames[0].Name)
+	} else {
+		title = "Your turn in Go!"
+		body = fmt.Sprintf("It's your turn in %d games", len(newTurnGames))
+	}
+
+	// Use the first game for the deep link
+	firstGame := newTurnGames[0]
+	webURL := fmt.Sprintf("https://online-go.com/game/%d", firstGame.ID)
+	appURL := fmt.Sprintf("ogs://game/%d", firstGame.ID)  // Custom URL scheme for the app
+
+	// Create notification payload with both web and app URLs
+	notification := &apns2.Notification{}
+	notification.DeviceToken = deviceToken
+	notification.Topic = os.Getenv("APNS_BUNDLE_ID")
+
+	// Add URLs and action data for iOS app to handle
+	payload := payload.NewPayload().Alert(title).
+		AlertBody(body).
+		Badge(len(newTurnGames)).
+		Sound("default").
+		Custom("web_url", webURL).        // For opening in Safari as fallback
+		Custom("app_url", appURL).        // For opening in app
+		Custom("game_id", firstGame.ID).
+		Custom("action", "open_game").
+		Custom("game_name", firstGame.Name)
+
+	notification.Payload = payload
+	notification.CollapseID = "game_turn"  // Group similar notifications
+
+	// Send the notification
+	res, err := apnsClient.Push(notification)
+	if err != nil {
+		log.Printf("Error sending push notification to user %s: %v", userID, err)
+		return
+	}
+
+	if res.Sent() {
+		log.Printf("Push notification sent successfully to user %s for %d game(s). Web URL: %s, App URL: %s", userID, len(newTurnGames), webURL, appURL)
+	} else {
+		log.Printf("Push notification failed for user %s: %v", userID, res.Reason)
+	}
+}
+
 func sendPushNotification(userID, gameName string) {
+	// Legacy function - keeping for backward compatibility with test endpoint
 	if apnsClient == nil {
 		log.Printf("APNs client not initialized, skipping push notification for user %s", userID)
 		return
@@ -407,7 +481,7 @@ func sendPushNotification(userID, gameName string) {
 	// Create notification payload
 	notification := &apns2.Notification{}
 	notification.DeviceToken = deviceToken
-	notification.Topic = os.Getenv("APNS_BUNDLE_ID") // Should be set to your app's bundle ID
+	notification.Topic = os.Getenv("APNS_BUNDLE_ID")
 
 	payload := payload.NewPayload().Alert("Your turn in Go!").
 		AlertBody(fmt.Sprintf("It's your turn in: %s", gameName)).
