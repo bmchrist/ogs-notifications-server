@@ -62,19 +62,40 @@ type GameMove struct {
 }
 
 type MoveStorage struct {
-	mu           sync.RWMutex
-	moves        map[string]map[int]int64 // userID -> gameID -> lastMove
-	deviceTokens map[string]string        // userID -> deviceToken
+	mu                   sync.RWMutex
+	moves                map[string]map[int]int64 // userID -> gameID -> lastMove
+	deviceTokens         map[string]string        // userID -> deviceToken
+	lastNotificationTime map[string]int64         // userID -> unix timestamp
 }
 
 var storage = &MoveStorage{
-	moves:        make(map[string]map[int]int64),
-	deviceTokens: make(map[string]string),
+	moves:                make(map[string]map[int]int64),
+	deviceTokens:         make(map[string]string),
+	lastNotificationTime: make(map[string]int64),
 }
 
 type DeviceRegistration struct {
 	UserID      string `json:"user_id"`
 	DeviceToken string `json:"device_token"`
+}
+
+type GameDiagnostic struct {
+	GameID              int    `json:"game_id"`
+	LastMoveTimestamp   int64  `json:"last_move_timestamp"`
+	CurrentPlayer       int    `json:"current_player"`
+	IsYourTurn          bool   `json:"is_your_turn"`
+	GameName            string `json:"game_name,omitempty"`
+}
+
+type UserDiagnostics struct {
+	UserID                   string           `json:"user_id"`
+	DeviceTokenRegistered    bool             `json:"device_token_registered"`
+	DeviceTokenPreview       string           `json:"device_token_preview,omitempty"`
+	LastNotificationTime     int64            `json:"last_notification_time"`
+	MonitoredGames           []GameDiagnostic `json:"monitored_games"`
+	TotalActiveGames         int              `json:"total_active_games"`
+	ServerCheckInterval      string           `json:"server_check_interval"`
+	LastServerCheckTime      int64            `json:"last_server_check_time"`
 }
 
 type TestNotificationRequest struct {
@@ -98,6 +119,7 @@ func main() {
 	r.HandleFunc("/register", registerDevice).Methods("POST")
 	r.HandleFunc("/test-notification", testNotification).Methods("POST")
 	r.HandleFunc("/health", healthCheck).Methods("GET")
+	r.HandleFunc("/diagnostics/{userID}", getUserDiagnostics).Methods("GET")
 
 	log.Println("Server starting on :8080")
 	log.Println("Automatic turn checking enabled")
@@ -254,22 +276,27 @@ func loadStorage() {
 		log.Println("No existing moves.json file, starting fresh")
 		storage.moves = make(map[string]map[int]int64)
 		storage.deviceTokens = make(map[string]string)
+		storage.lastNotificationTime = make(map[string]int64)
 		return
 	}
 
-	// Try to load new format first (with device tokens)
+	// Try to load new format first (with device tokens and notification times)
 	var storageData struct {
-		Moves        map[string]map[int]int64 `json:"moves"`
-		DeviceTokens map[string]string        `json:"device_tokens"`
+		Moves                map[string]map[int]int64 `json:"moves"`
+		DeviceTokens         map[string]string        `json:"device_tokens"`
+		LastNotificationTime map[string]int64         `json:"last_notification_time"`
 	}
 
 	if err := json.Unmarshal(data, &storageData); err == nil && storageData.Moves != nil {
 		storage.moves = storageData.Moves
 		if storageData.DeviceTokens != nil {
 			storage.deviceTokens = storageData.DeviceTokens
-			log.Printf("Loaded storage: %d users with device tokens, %d users with move history",
-				len(storage.deviceTokens), len(storage.moves))
 		}
+		if storageData.LastNotificationTime != nil {
+			storage.lastNotificationTime = storageData.LastNotificationTime
+		}
+		log.Printf("Loaded storage: %d users with device tokens, %d users with move history, %d users with notification times",
+			len(storage.deviceTokens), len(storage.moves), len(storage.lastNotificationTime))
 		return
 	}
 
@@ -278,6 +305,7 @@ func loadStorage() {
 		log.Printf("Error loading moves.json: %v", err)
 		storage.moves = make(map[string]map[int]int64)
 		storage.deviceTokens = make(map[string]string)
+		storage.lastNotificationTime = make(map[string]int64)
 	}
 }
 
@@ -286,11 +314,13 @@ func saveStorage() {
 	defer storage.mu.RUnlock()
 
 	storageData := struct {
-		Moves        map[string]map[int]int64 `json:"moves"`
-		DeviceTokens map[string]string        `json:"device_tokens"`
+		Moves                map[string]map[int]int64 `json:"moves"`
+		DeviceTokens         map[string]string        `json:"device_tokens"`
+		LastNotificationTime map[string]int64         `json:"last_notification_time"`
 	}{
-		Moves:        storage.moves,
-		DeviceTokens: storage.deviceTokens,
+		Moves:                storage.moves,
+		DeviceTokens:         storage.deviceTokens,
+		LastNotificationTime: storage.lastNotificationTime,
 	}
 
 	data, err := json.MarshalIndent(storageData, "", "  ")
@@ -302,8 +332,8 @@ func saveStorage() {
 	if err := os.WriteFile("moves.json", data, 0644); err != nil {
 		log.Printf("Error saving moves.json: %v", err)
 	} else {
-		log.Printf("Storage saved: %d users with device tokens, %d users with move history",
-			len(storage.deviceTokens), len(storage.moves))
+		log.Printf("Storage saved: %d users with device tokens, %d users with move history, %d notification times",
+			len(storage.deviceTokens), len(storage.moves), len(storage.lastNotificationTime))
 	}
 }
 
@@ -443,6 +473,68 @@ func testNotification(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(response)
 }
 
+func getUserDiagnostics(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	userIDStr := vars["userID"]
+
+	log.Printf("Diagnostics request for user %s from %s", userIDStr, r.RemoteAddr)
+
+	userID, err := strconv.Atoi(userIDStr)
+	if err != nil {
+		log.Printf("Invalid user ID in diagnostics request: %s", userIDStr)
+		http.Error(w, "Invalid user ID", http.StatusBadRequest)
+		return
+	}
+
+	// Check if user is registered
+	storage.mu.RLock()
+	deviceToken, hasDeviceToken := storage.deviceTokens[userIDStr]
+	lastNotificationTime := storage.lastNotificationTime[userIDStr]
+	storage.mu.RUnlock()
+
+	// Get current games from OGS API
+	games, err := getActiveGames(userID)
+	if err != nil {
+		log.Printf("Failed to get active games for user %s in diagnostics: %v", userIDStr, err)
+		http.Error(w, "Failed to fetch user games", http.StatusServiceUnavailable)
+		return
+	}
+
+	// Build diagnostics response
+	diagnostics := UserDiagnostics{
+		UserID:                userIDStr,
+		DeviceTokenRegistered: hasDeviceToken,
+		LastNotificationTime:  lastNotificationTime,
+		TotalActiveGames:      len(games),
+		ServerCheckInterval:   "30s", // Could make this dynamic
+		LastServerCheckTime:   time.Now().Unix(),
+		MonitoredGames:        make([]GameDiagnostic, 0),
+	}
+
+	// Add device token preview if available
+	if hasDeviceToken && len(deviceToken) > 16 {
+		diagnostics.DeviceTokenPreview = deviceToken[:16] + "..."
+	}
+
+	// Build game diagnostics
+	for _, game := range games {
+		gameDiag := GameDiagnostic{
+			GameID:            game.ID,
+			LastMoveTimestamp: game.JSON.Clock.LastMove,
+			CurrentPlayer:     game.JSON.Clock.CurrentPlayer,
+			IsYourTurn:        game.JSON.Clock.CurrentPlayer == userID,
+			GameName:          game.Name,
+		}
+		diagnostics.MonitoredGames = append(diagnostics.MonitoredGames, gameDiag)
+	}
+
+	log.Printf("Diagnostics generated for user %s: %d games, device_registered=%t, last_notification=%d",
+		userIDStr, len(games), hasDeviceToken, lastNotificationTime)
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(diagnostics)
+}
+
 func sendConsolidatedPushNotification(userID string, newTurnGames []Game) {
 	log.Printf("Preparing push notification for user %s with %d new turn games", userID, len(newTurnGames))
 
@@ -510,6 +602,13 @@ func sendConsolidatedPushNotification(userID string, newTurnGames []Game) {
 
 	if res.Sent() {
 		log.Printf("Push notification sent successfully to user %s for %d game(s). Web URL: %s, App URL: %s", userID, len(newTurnGames), webURL, appURL)
+
+		// Update last notification time
+		storage.mu.Lock()
+		storage.lastNotificationTime[userID] = time.Now().Unix()
+		storage.mu.Unlock()
+
+		saveStorage()
 	} else {
 		log.Printf("Push notification failed for user %s: %v", userID, res.Reason)
 	}
@@ -565,10 +664,6 @@ func startPeriodicChecking() {
 	if intervalStr := os.Getenv("CHECK_INTERVAL_SECONDS"); intervalStr != "" {
 		if interval, err := strconv.Atoi(intervalStr); err == nil {
 			checkInterval = time.Duration(interval) * time.Second
-		}
-	} else if intervalStr := os.Getenv("CHECK_INTERVAL_MINUTES"); intervalStr != "" {
-		if interval, err := strconv.Atoi(intervalStr); err == nil {
-			checkInterval = time.Duration(interval) * time.Minute
 		}
 	}
 

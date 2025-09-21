@@ -60,10 +60,11 @@ The server will:
 ### Register a Device Token
 
 ```bash
-POST /register/:user_id
+POST /register
 Content-Type: application/json
 
 {
+  "user_id": "your_ogs_user_id",
   "device_token": "your_ios_device_token_here"
 }
 ```
@@ -127,9 +128,9 @@ CHECK_INTERVAL_MINUTES=1 ./ogs-server
 
 ### Manual Testing
 ```bash
-curl -X POST http://localhost:8080/register/YOUR_USER_ID \
+curl -X POST http://localhost:8080/register \
   -H "Content-Type: application/json" \
-  -d '{"device_token": "YOUR_DEVICE_TOKEN"}'
+  -d '{"user_id": "YOUR_USER_ID", "device_token": "YOUR_DEVICE_TOKEN"}'
 
 curl http://localhost:8080/check/YOUR_USER_ID
 ```
