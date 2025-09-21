@@ -6,7 +6,9 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"os"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/gorilla/mux"
@@ -30,7 +32,8 @@ type GameState struct {
 }
 
 type Clock struct {
-	CurrentPlayer int `json:"current_player"`
+	CurrentPlayer int   `json:"current_player"`
+	LastMove      int64 `json:"last_move"`
 }
 
 type PlayerResponse struct {
@@ -38,13 +41,28 @@ type PlayerResponse struct {
 }
 
 type TurnStatus struct {
-	UserID      int    `json:"user_id"`
-	GamesCount  int    `json:"games_count"`
-	YourTurn    []Game `json:"your_turn"`
-	WaitingFor  []Game `json:"waiting_for"`
+	NotYourTurn  []int `json:"not_your_turn"`
+	YourTurnNew  []int `json:"your_turn_new"`
+	YourTurnOld  []int `json:"your_turn_old"`
+}
+
+type GameMove struct {
+	GameID   int   `json:"game_id"`
+	LastMove int64 `json:"last_move"`
+}
+
+type MoveStorage struct {
+	mu    sync.RWMutex
+	moves map[string]map[int]int64 // userID -> gameID -> lastMove
+}
+
+var storage = &MoveStorage{
+	moves: make(map[string]map[int]int64),
 }
 
 func main() {
+	loadStorage()
+
 	r := mux.NewRouter()
 
 	r.HandleFunc("/check/{userID}", checkUserTurn).Methods("GET")
@@ -86,20 +104,29 @@ func getUserTurnStatus(userID int) (*TurnStatus, error) {
 	}
 
 	status := &TurnStatus{
-		UserID:     userID,
-		GamesCount: len(games),
-		YourTurn:   []Game{},
-		WaitingFor: []Game{},
+		NotYourTurn: []int{},
+		YourTurnNew: []int{},
+		YourTurnOld: []int{},
 	}
+
+	userIDStr := strconv.Itoa(userID)
 
 	for _, game := range games {
 		if game.JSON.Clock.CurrentPlayer == userID {
-			status.YourTurn = append(status.YourTurn, game)
+			// Check if this is a new turn vs old turn
+			if isNewTurn(userIDStr, game.ID, game.JSON.Clock.LastMove) {
+				status.YourTurnNew = append(status.YourTurnNew, game.ID)
+				// Update stored move for new turns
+				updateStoredMove(userIDStr, game.ID, game.JSON.Clock.LastMove)
+			} else {
+				status.YourTurnOld = append(status.YourTurnOld, game.ID)
+			}
 		} else {
-			status.WaitingFor = append(status.WaitingFor, game)
+			status.NotYourTurn = append(status.NotYourTurn, game.ID)
 		}
 	}
 
+	saveStorage()
 	return status, nil
 }
 
@@ -128,5 +155,63 @@ func getActiveGames(userID int) ([]Game, error) {
 	}
 
 	return response.ActiveGames, nil
+}
+
+func isNewTurn(userID string, gameID int, currentMove int64) bool {
+	storage.mu.RLock()
+	defer storage.mu.RUnlock()
+
+	userMoves, exists := storage.moves[userID]
+	if !exists {
+		return true // First time seeing this user
+	}
+
+	lastMove, exists := userMoves[gameID]
+	if !exists {
+		return true // First time seeing this game for this user
+	}
+
+	return currentMove > lastMove // New move since last check
+}
+
+func updateStoredMove(userID string, gameID int, lastMove int64) {
+	storage.mu.Lock()
+	defer storage.mu.Unlock()
+
+	if storage.moves[userID] == nil {
+		storage.moves[userID] = make(map[int]int64)
+	}
+	storage.moves[userID][gameID] = lastMove
+}
+
+func loadStorage() {
+	storage.mu.Lock()
+	defer storage.mu.Unlock()
+
+	data, err := os.ReadFile("moves.json")
+	if err != nil {
+		log.Println("No existing moves.json file, starting fresh")
+		return
+	}
+
+	if err := json.Unmarshal(data, &storage.moves); err != nil {
+		log.Printf("Error loading moves.json: %v", err)
+		storage.moves = make(map[string]map[int]int64)
+	}
+}
+
+func saveStorage() {
+	storage.mu.RLock()
+	defer storage.mu.RUnlock()
+
+	data, err := json.MarshalIndent(storage.moves, "", "  ")
+	if err != nil {
+		log.Printf("Error marshaling moves: %v", err)
+		return
+	}
+
+	if err := os.WriteFile("moves.json", data, 0644); err != nil {
+		log.Printf("Error saving moves.json: %v", err)
+	}
 }
 
