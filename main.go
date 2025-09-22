@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -11,6 +12,8 @@ import (
 	"sync"
 	"time"
 
+	secretmanager "cloud.google.com/go/secretmanager/apiv1"
+	"cloud.google.com/go/secretmanager/apiv1/secretmanagerpb"
 	"github.com/gorilla/mux"
 	"github.com/sideshow/apns2"
 	"github.com/sideshow/apns2/payload"
@@ -87,6 +90,11 @@ type UserDiagnostics struct {
 	LastServerCheckTime      int64            `json:"last_server_check_time"`
 }
 
+type DeviceTokenUsers struct {
+	DeviceToken string   `json:"device_token"`
+	UserIDs     []string `json:"user_ids"`
+}
+
 
 var apnsClient *apns2.Client
 
@@ -101,6 +109,7 @@ func main() {
 
 	r.HandleFunc("/check/{userID}", checkUserTurn).Methods("GET")
 	r.HandleFunc("/register", registerDevice).Methods("POST")
+	r.HandleFunc("/users-by-token/{deviceToken}", getUsersByDeviceToken).Methods("GET")
 	r.HandleFunc("/health", healthCheck).Methods("GET")
 	r.HandleFunc("/diagnostics/{userID}", getUserDiagnostics).Methods("GET")
 
@@ -314,22 +323,107 @@ func saveStorage() {
 	}
 }
 
+func getSecret(secretName string) (string, error) {
+	projectID := os.Getenv("GOOGLE_CLOUD_PROJECT")
+	if projectID == "" {
+		return "", fmt.Errorf("GOOGLE_CLOUD_PROJECT environment variable not set")
+	}
+
+	ctx := context.Background()
+	client, err := secretmanager.NewClient(ctx)
+	if err != nil {
+		return "", fmt.Errorf("failed to create secretmanager client: %v", err)
+	}
+	defer client.Close()
+
+	req := &secretmanagerpb.AccessSecretVersionRequest{
+		Name: fmt.Sprintf("projects/%s/secrets/%s/versions/latest", projectID, secretName),
+	}
+
+	result, err := client.AccessSecretVersion(ctx, req)
+	log.Printf("result of running function getsecret %s", result)
+	if err != nil {
+		return "", fmt.Errorf("failed to access secret %s: %v", secretName, err)
+	}
+
+	return string(result.Payload.Data), nil
+}
+
+func getAPNSConfig() (keyData []byte, keyID, teamID, bundleID string, isDevelopment bool, err error) {
+	//environment := os.Getenv("ENVIRONMENT")
+
+	if true { //environment == "production" {
+		log.Println("Loading APNs configuration from Secret Manager...")
+
+		// Get configuration from Secret Manager
+		keyDataStr, err := getSecret("apns-key")
+		if err != nil {
+			return nil, "", "", "", false, fmt.Errorf("failed to get APNs key from Secret Manager: %v", err)
+		}
+		keyData = []byte(keyDataStr)
+
+		keyID, err = getSecret("apns-key-id")
+		if err != nil {
+			return nil, "", "", "", false, fmt.Errorf("failed to get APNs key ID from Secret Manager: %v", err)
+		}
+
+		teamID, err = getSecret("apns-team-id")
+		if err != nil {
+			return nil, "", "", "", false, fmt.Errorf("failed to get APNs team ID from Secret Manager: %v", err)
+		}
+
+		bundleID, err = getSecret("apns-bundle-id")
+		if err != nil {
+			return nil, "", "", "", false, fmt.Errorf("failed to get APNs bundle ID from Secret Manager: %v", err)
+		}
+
+		isDevelopment = false // Production always uses production APNs
+		log.Println("APNs configuration loaded from Secret Manager")
+	} else {
+		log.Println("Loading APNs configuration from environment variables...")
+
+		// Get configuration from environment variables
+		keyPath := os.Getenv("APNS_KEY_PATH")
+		if keyPath == "" {
+			return nil, "", "", "", false, fmt.Errorf("APNS_KEY_PATH environment variable not set")
+		}
+
+		if _, err := os.Stat(keyPath); os.IsNotExist(err) {
+			return nil, "", "", "", false, fmt.Errorf("APNs key file not found at %s", keyPath)
+		}
+
+		keyData, err = os.ReadFile(keyPath)
+		if err != nil {
+			return nil, "", "", "", false, fmt.Errorf("failed to read APNs key file: %v", err)
+		}
+
+		keyID = os.Getenv("APNS_KEY_ID")
+		teamID = os.Getenv("APNS_TEAM_ID")
+		bundleID = os.Getenv("APNS_BUNDLE_ID")
+		isDevelopment = os.Getenv("APNS_DEVELOPMENT") == "true"
+
+		log.Printf("APNs configuration loaded from environment variables (development=%t)", isDevelopment)
+	}
+
+	if keyID == "" || teamID == "" || bundleID == "" {
+		return nil, "", "", "", false, fmt.Errorf("missing required APNs configuration (key_id, team_id, or bundle_id)")
+	}
+
+	return keyData, keyID, teamID, bundleID, isDevelopment, nil
+}
+
 func initAPNS() {
-	keyPath := os.Getenv("APNS_KEY_PATH")
-	keyID := os.Getenv("APNS_KEY_ID")
-	teamID := os.Getenv("APNS_TEAM_ID")
+	keyData, keyID, teamID, bundleID, isDevelopment, err := getAPNSConfig()
 
-	if keyPath == "" || keyID == "" || teamID == "" {
-		log.Printf("APNs configuration incomplete. Required: APNS_KEY_PATH, APNS_KEY_ID, APNS_TEAM_ID. Push notifications will be disabled.")
+	if err != nil {
+		log.Printf("APNs configuration error: %v. Push notifications will be disabled.", err)
 		return
 	}
 
-	if _, err := os.Stat(keyPath); os.IsNotExist(err) {
-		log.Printf("APNs key file not found at %s. Push notifications will be disabled.", keyPath)
-		return
-	}
+	// Store bundle ID in environment for later use
+	os.Setenv("APNS_BUNDLE_ID", bundleID)
 
-	authKey, err := token.AuthKeyFromFile(keyPath)
+	authKey, err := token.AuthKeyFromBytes(keyData)
 	if err != nil {
 		log.Printf("Error loading APNs auth key: %v. Push notifications will be disabled.", err)
 		return
@@ -341,13 +435,11 @@ func initAPNS() {
 		TeamID:  teamID,
 	}
 
-	// Use sandbox for development, production for release
-	isDevelopment := os.Getenv("APNS_DEVELOPMENT") == "true"
 	if isDevelopment {
 		apnsClient = apns2.NewTokenClient(tokenProvider).Development()
 		log.Println("APNs client initialized for development")
 	} else {
-		apnsClient = apns2.NewTokenClient(tokenProvider).Production()
+		apnsClient = apns2.NewTokenClient(tokenProvider).Development()
 		log.Println("APNs client initialized for production")
 	}
 }
@@ -445,6 +537,38 @@ func getUserDiagnostics(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(diagnostics)
 }
 
+func getUsersByDeviceToken(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	deviceToken := vars["deviceToken"]
+
+	log.Printf("Users by device token request for token: %s...", deviceToken[:min(16, len(deviceToken))])
+
+	if deviceToken == "" {
+		http.Error(w, "Device token is required", http.StatusBadRequest)
+		return
+	}
+
+	// Search through all device tokens to find matching user IDs
+	storage.mu.RLock()
+	var matchingUserIDs []string
+	for userID, token := range storage.deviceTokens {
+		if token == deviceToken {
+			matchingUserIDs = append(matchingUserIDs, userID)
+		}
+	}
+	storage.mu.RUnlock()
+
+	response := DeviceTokenUsers{
+		DeviceToken: deviceToken,
+		UserIDs:     matchingUserIDs,
+	}
+
+	log.Printf("Found %d user(s) for device token: %v", len(matchingUserIDs), matchingUserIDs)
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(response)
+}
+
 func sendConsolidatedPushNotification(userID string, newTurnGames []Game) {
 	log.Printf("Preparing push notification for user %s with %d new turn games", userID, len(newTurnGames))
 
@@ -471,7 +595,6 @@ func sendConsolidatedPushNotification(userID string, newTurnGames []Game) {
 
 	// Get environment name (defaults to "none" if not set)
 	environment := os.Getenv("ENVIRONMENT")
-	log.Printf("Environment: %s", environment)
 	if environment == "" {
 		environment = "none"
 	}
@@ -502,7 +625,7 @@ func sendConsolidatedPushNotification(userID string, newTurnGames []Game) {
 	// Create notification payload with both web and app URLs
 	notification := &apns2.Notification{}
 	notification.DeviceToken = deviceToken
-	notification.Topic = os.Getenv("APNS_BUNDLE_ID")
+	notification.Topic = "online-go-server-push-notification"
 
 	// Add URLs and action data for iOS app to handle
 	payload := payload.NewPayload().Alert(title).

@@ -86,6 +86,14 @@ GET /diagnostics/:user_id
 
 Returns comprehensive user status including device registration, monitored games, and last notification time.
 
+### Find Users by Device Token
+
+```bash
+GET /users-by-token/:device_token
+```
+
+Returns all user IDs that are registered to a specific device token. Useful for iOS apps to discover which OGS users are monitored on the current device.
+
 ## Getting Your OGS User ID
 
 1. Go to your profile on [Online-Go.com](https://online-go.com)

@@ -41,13 +41,30 @@ GET /check/:user_id
 - **Purpose**: Manually trigger turn checking (primarily for testing)
 - **Note**: Not needed in normal operation since server auto-checks every 30 seconds
 
-### User Diagnostics (New!)
+### User Diagnostics
 ```
 GET /diagnostics/:user_id
 ```
 - **Purpose**: Get comprehensive diagnostics for debugging and user information display
 - **iOS Implementation**: Call this to show user status, game information, and server health
 - **Returns**: JSON with user status, monitored games, last notification time, and server info
+
+### Find Users by Device Token (New!)
+```
+GET /users-by-token/:device_token
+```
+- **Purpose**: Find all user IDs registered to a specific device token
+- **iOS Implementation**: Call this on app launch to discover which OGS users are monitored on this device
+- **Use Case**: Multi-user support, switching between monitored accounts
+- **Returns**: JSON with device token and array of user IDs
+
+#### Users by Device Token Response Format
+```json
+{
+  "device_token": "808605752f2f8d4c4c37e9457668f80cdf20b4d2463c93d00fc7a4698e16afab67a8c99118c296a5177fb7e796063a09eb55f40e269612bfc7f5055069bf73b68d2b774d85e53b96a6b9545f5dcc866a",
+  "user_ids": ["1783478", "123456"]
+}
+```
 
 #### Diagnostics Response Format
 ```json
