@@ -135,7 +135,8 @@ func checkUserTurn(w http.ResponseWriter, r *http.Request) {
 
 	status, err := getUserTurnStatus(userID)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		log.Printf("Error getting user turn status for user %d: %v", userID, err)
+		http.Error(w, "Failed to fetch turn status", http.StatusInternalServerError)
 		return
 	}
 
@@ -199,26 +200,28 @@ func getActiveGames(userID int) ([]Game, error) {
 	client := &http.Client{Timeout: 10 * time.Second}
 	resp, err := client.Get(url)
 	if err != nil {
-		log.Printf("OGS API request failed: %v", err)
-		return nil, fmt.Errorf("failed to fetch games: %v", err)
+		log.Printf("OGS API request failed for user %d: %v", userID, err)
+		return nil, fmt.Errorf("failed to fetch games")
 	}
 	defer resp.Body.Close()
 
 	log.Printf("OGS API response status: %d", resp.StatusCode)
 
 	if resp.StatusCode != http.StatusOK {
-		log.Printf("OGS API returned non-200 status: %d", resp.StatusCode)
-		return nil, fmt.Errorf("API returned status %d", resp.StatusCode)
+		log.Printf("OGS API returned non-200 status: %d for user %d", resp.StatusCode, userID)
+		return nil, fmt.Errorf("API request failed")
 	}
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read response: %v", err)
+		log.Printf("Failed to read OGS API response for user %d: %v", userID, err)
+		return nil, fmt.Errorf("failed to process response")
 	}
 
 	var response PlayerResponse
 	if err := json.Unmarshal(body, &response); err != nil {
-		return nil, fmt.Errorf("failed to parse response: %v", err)
+		log.Printf("Failed to parse OGS API response for user %d: %v", userID, err)
+		return nil, fmt.Errorf("failed to process response")
 	}
 
 	return response.ActiveGames, nil
@@ -315,7 +318,7 @@ func saveStorage() {
 		return
 	}
 
-	if err := os.WriteFile("moves.json", data, 0644); err != nil {
+	if err := os.WriteFile("moves.json", data, 0600); err != nil {
 		log.Printf("Error saving moves.json: %v", err)
 	} else {
 		log.Printf("Storage saved: %d users with device tokens, %d users with move history, %d notification times",
@@ -341,9 +344,9 @@ func getSecret(secretName string) (string, error) {
 	}
 
 	result, err := client.AccessSecretVersion(ctx, req)
-	log.Printf("result of running function getsecret %s", result)
 	if err != nil {
-		return "", fmt.Errorf("failed to access secret %s: %v", secretName, err)
+		log.Printf("Failed to access secret %s: %v", secretName, err)
+		return "", fmt.Errorf("failed to access secret")
 	}
 
 	return string(result.Payload.Data), nil
@@ -358,23 +361,27 @@ func getAPNSConfig() (keyData []byte, keyID, teamID, bundleID string, isDevelopm
 		// Get configuration from Secret Manager
 		keyDataStr, err := getSecret("apns-key")
 		if err != nil {
-			return nil, "", "", "", false, fmt.Errorf("failed to get APNs key from Secret Manager: %v", err)
+			log.Printf("Failed to get APNs key: %v", err)
+			return nil, "", "", "", false, fmt.Errorf("failed to load APNs configuration")
 		}
 		keyData = []byte(keyDataStr)
 
 		keyID, err = getSecret("apns-key-id")
 		if err != nil {
-			return nil, "", "", "", false, fmt.Errorf("failed to get APNs key ID from Secret Manager: %v", err)
+			log.Printf("Failed to get APNs key ID: %v", err)
+			return nil, "", "", "", false, fmt.Errorf("failed to load APNs configuration")
 		}
 
 		teamID, err = getSecret("apns-team-id")
 		if err != nil {
-			return nil, "", "", "", false, fmt.Errorf("failed to get APNs team ID from Secret Manager: %v", err)
+			log.Printf("Failed to get APNs team ID: %v", err)
+			return nil, "", "", "", false, fmt.Errorf("failed to load APNs configuration")
 		}
 
 		bundleID, err = getSecret("apns-bundle-id")
 		if err != nil {
-			return nil, "", "", "", false, fmt.Errorf("failed to get APNs bundle ID from Secret Manager: %v", err)
+			log.Printf("Failed to get APNs bundle ID: %v", err)
+			return nil, "", "", "", false, fmt.Errorf("failed to load APNs configuration")
 		}
 
 		isDevelopment = false // Production always uses production APNs
@@ -394,7 +401,8 @@ func getAPNSConfig() (keyData []byte, keyID, teamID, bundleID string, isDevelopm
 
 		keyData, err = os.ReadFile(keyPath)
 		if err != nil {
-			return nil, "", "", "", false, fmt.Errorf("failed to read APNs key file: %v", err)
+			log.Printf("Failed to read APNs key file: %v", err)
+			return nil, "", "", "", false, fmt.Errorf("failed to load APNs configuration")
 		}
 
 		keyID = os.Getenv("APNS_KEY_ID")
@@ -460,8 +468,8 @@ func registerDevice(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	log.Printf("Registering device for user %s (token: %s...)",
-		registration.UserID, registration.DeviceToken[:min(16, len(registration.DeviceToken))])
+	log.Printf("Registering device for user %s (token length: %d)",
+		registration.UserID, len(registration.DeviceToken))
 
 	storage.mu.Lock()
 	storage.deviceTokens[registration.UserID] = registration.DeviceToken
@@ -490,7 +498,7 @@ func getUserDiagnostics(w http.ResponseWriter, r *http.Request) {
 
 	// Check if user is registered
 	storage.mu.RLock()
-	deviceToken, hasDeviceToken := storage.deviceTokens[userIDStr]
+	_, hasDeviceToken := storage.deviceTokens[userIDStr]
 	lastNotificationTime := storage.lastNotificationTime[userIDStr]
 	storage.mu.RUnlock()
 
@@ -514,8 +522,8 @@ func getUserDiagnostics(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Add device token preview if available
-	if hasDeviceToken && len(deviceToken) > 16 {
-		diagnostics.DeviceTokenPreview = deviceToken[:16] + "..."
+	if hasDeviceToken {
+		diagnostics.DeviceTokenPreview = "[REGISTERED]"
 	}
 
 	// Build game diagnostics
@@ -541,7 +549,7 @@ func getUsersByDeviceToken(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	deviceToken := vars["deviceToken"]
 
-	log.Printf("Users by device token request for token: %s...", deviceToken[:min(16, len(deviceToken))])
+	log.Printf("Users by device token request (token length: %d)", len(deviceToken))
 
 	if deviceToken == "" {
 		http.Error(w, "Device token is required", http.StatusBadRequest)
@@ -591,7 +599,7 @@ func sendConsolidatedPushNotification(userID string, newTurnGames []Game) {
 		return
 	}
 
-	log.Printf("Found device token for user %s (token: %s...)", userID, deviceToken[:min(16, len(deviceToken))])
+	log.Printf("Found device token for user %s", userID)
 
 	// Get environment name (defaults to "none" if not set)
 	environment := os.Getenv("ENVIRONMENT")
