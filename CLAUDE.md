@@ -17,12 +17,239 @@ The OGS Notifications Server is a Go application that monitors Online-Go.com gam
 5. **Send notification**: Consolidated message for all qualifying games
 6. **Update timestamp**: Set `last_notification_time` to current unix timestamp
 
+## API Key Authentication (NEW!)
+
+All protected endpoints now require API key authentication following Apple's security best practices.
+
+### Obtaining an API Key
+```
+POST /generate-api-key
+Content-Type: application/json
+
+{
+  "user_id": "your_ogs_user_id",
+  "master_key": "master_key_from_server_admin",
+  "description": "iOS App - iPhone 15 Pro"
+}
+```
+
+**Response:**
+```json
+{
+  "api_key": "64-character-hex-api-key",
+  "user_id": "1783478",
+  "created_at": "2025-09-22T14:30:00Z",
+  "description": "iOS App - iPhone 15 Pro"
+}
+```
+
+### Using the API Key
+
+All protected endpoints require the API key in the `X-API-Key` header:
+```
+X-API-Key: your-64-character-api-key
+```
+
+### iOS Implementation Guidelines
+
+#### Secure Storage with Keychain
+
+**IMPORTANT**: Never store API keys in UserDefaults, plist files, or hardcode them. Use iOS Keychain for secure storage.
+
+```swift
+import Security
+
+class APIKeyManager {
+    static let shared = APIKeyManager()
+    private let keychainKey = "com.ogs.notifications.apikey"
+    private let keychainAccessGroup = "your.app.group" // Optional for app groups
+
+    // Save API key to Keychain
+    func saveAPIKey(_ apiKey: String) -> Bool {
+        guard let data = apiKey.data(using: .utf8) else { return false }
+
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrAccount as String: keychainKey,
+            kSecValueData as String: data,
+            kSecAttrAccessible as String: kSecAttrAccessibleWhenUnlockedThisDeviceOnly
+        ]
+
+        // Delete any existing key
+        SecItemDelete(query as CFDictionary)
+
+        // Add new key
+        let status = SecItemAdd(query as CFDictionary, nil)
+        return status == errSecSuccess
+    }
+
+    // Retrieve API key from Keychain
+    func getAPIKey() -> String? {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrAccount as String: keychainKey,
+            kSecReturnData as String: true,
+            kSecMatchLimit as String: kSecMatchLimitOne
+        ]
+
+        var dataTypeRef: AnyObject?
+        let status = SecItemCopyMatching(query as CFDictionary, &dataTypeRef)
+
+        guard status == errSecSuccess,
+              let data = dataTypeRef as? Data,
+              let apiKey = String(data: data, encoding: .utf8) else {
+            return nil
+        }
+
+        return apiKey
+    }
+
+    // Delete API key from Keychain
+    func deleteAPIKey() -> Bool {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrAccount as String: keychainKey
+        ]
+
+        let status = SecItemDelete(query as CFDictionary)
+        return status == errSecSuccess || status == errSecItemNotFound
+    }
+}
+```
+
+#### Network Requests with Authentication
+
+```swift
+class OGSNotificationService {
+    private let baseURL = "https://your-server.com"
+
+    func makeAuthenticatedRequest(endpoint: String, method: String = "GET", body: Data? = nil) async throws -> Data {
+        guard let apiKey = APIKeyManager.shared.getAPIKey() else {
+            throw APIError.noAPIKey
+        }
+
+        guard let url = URL(string: "\(baseURL)\(endpoint)") else {
+            throw APIError.invalidURL
+        }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = method
+        request.setValue(apiKey, forHTTPHeaderField: "X-API-Key")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+
+        if let body = body {
+            request.httpBody = body
+        }
+
+        let (data, response) = try await URLSession.shared.data(for: request)
+
+        guard let httpResponse = response as? HTTPURLResponse else {
+            throw APIError.invalidResponse
+        }
+
+        switch httpResponse.statusCode {
+        case 200...299:
+            return data
+        case 401:
+            throw APIError.unauthorized
+        case 403:
+            throw APIError.forbidden
+        default:
+            throw APIError.serverError(httpResponse.statusCode)
+        }
+    }
+
+    // Example: Register device
+    func registerDevice(userID: String, deviceToken: String) async throws {
+        let payload = [
+            "user_id": userID,
+            "device_token": deviceToken
+        ]
+
+        let jsonData = try JSONSerialization.data(withJSONObject: payload)
+        _ = try await makeAuthenticatedRequest(endpoint: "/register", method: "POST", body: jsonData)
+    }
+
+    // Example: Get diagnostics
+    func getDiagnostics(for userID: String) async throws -> UserDiagnostics {
+        let data = try await makeAuthenticatedRequest(endpoint: "/diagnostics/\(userID)")
+        return try JSONDecoder().decode(UserDiagnostics.self, from: data)
+    }
+}
+
+enum APIError: LocalizedError {
+    case noAPIKey
+    case invalidURL
+    case invalidResponse
+    case unauthorized
+    case forbidden
+    case serverError(Int)
+
+    var errorDescription: String? {
+        switch self {
+        case .noAPIKey:
+            return "No API key found. Please log in again."
+        case .unauthorized:
+            return "Invalid API key. Please log in again."
+        case .forbidden:
+            return "Access forbidden. Please check your permissions."
+        case .serverError(let code):
+            return "Server error (\(code)). Please try again."
+        default:
+            return "An error occurred. Please try again."
+        }
+    }
+}
+```
+
+#### Initial Setup Flow
+
+1. **First Launch**: Check Keychain for existing API key
+2. **No API Key Found**: Show login/setup screen
+3. **User Provides Credentials**:
+   - For new users: Admin generates API key via `/generate-api-key` endpoint
+   - Provide API key to user through secure channel
+4. **Store API Key**: Save to Keychain using `APIKeyManager`
+5. **Register Device**: Call `/register` endpoint with API key
+6. **Begin Monitoring**: Server starts checking for turns
+
+#### Security Best Practices
+
+1. **Never expose the master key**: Keep it secure on the server
+2. **Use HTTPS only**: Never send API keys over unencrypted connections
+3. **Implement key rotation**: Allow users to regenerate keys if compromised
+4. **Add biometric protection**: Use Face ID/Touch ID for additional security
+5. **Clear on logout**: Delete API key from Keychain when user logs out
+6. **Handle 401 errors**: Prompt re-authentication on unauthorized responses
+
+```swift
+// Biometric protection example
+import LocalAuthentication
+
+func authenticateWithBiometrics(completion: @escaping (Bool) -> Void) {
+    let context = LAContext()
+    var error: NSError?
+
+    if context.canEvaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, error: &error) {
+        context.evaluatePolicy(.deviceOwnerAuthenticationWithBiometrics,
+                              localizedReason: "Authenticate to access OGS notifications") { success, _ in
+            DispatchQueue.main.async {
+                completion(success)
+            }
+        }
+    } else {
+        completion(false)
+    }
+}
+```
+
 ## Server Endpoints for iOS Integration
 
-### Device Registration
+### Device Registration (Protected)
 ```
 POST /register
 Content-Type: application/json
+X-API-Key: your-api-key
 
 {
   "user_id": "your_ogs_user_id",
@@ -34,24 +261,27 @@ Content-Type: application/json
 - **User ID**: Can be obtained from OGS profile URL (e.g., `https://online-go.com/user/view/1783478`)
 - **Server Behavior**: Stores device token and begins monitoring this user every 30 seconds
 
-### Manual Check (Optional)
+### Manual Check (Protected)
 ```
 GET /check/:user_id
+X-API-Key: your-api-key
 ```
 - **Purpose**: Manually trigger turn checking (primarily for testing)
 - **Note**: Not needed in normal operation since server auto-checks every 30 seconds
 
-### User Diagnostics
+### User Diagnostics (Protected)
 ```
 GET /diagnostics/:user_id
+X-API-Key: your-api-key
 ```
 - **Purpose**: Get comprehensive diagnostics for debugging and user information display
 - **iOS Implementation**: Call this to show user status, game information, and server health
 - **Returns**: JSON with user status, monitored games, last notification time, and server info
 
-### Find Users by Device Token (New!)
+### Find Users by Device Token (Protected)
 ```
 GET /users-by-token/:device_token
+X-API-Key: your-api-key
 ```
 - **Purpose**: Find all user IDs registered to a specific device token
 - **iOS Implementation**: Call this on app launch to discover which OGS users are monitored on this device
