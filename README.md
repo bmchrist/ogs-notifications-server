@@ -9,6 +9,7 @@ A Go server that monitors [Online-Go.com](https://online-go.com) games and sends
 - **Deep Linking**: Notifications include both web URLs and iOS app URLs for seamless game access
 - **Smart Notifications**: Combines multiple new turns into a single notification to avoid spam
 - **Persistent Tracking**: Remembers which moves you've already been notified about
+- **API Key Authentication**: Secure API key-based authentication for all endpoints
 
 ## Quick Start
 
@@ -42,6 +43,7 @@ A Go server that monitors [Online-Go.com](https://online-go.com) games and sends
    - `APNS_DEVELOPMENT`: Set to `true` for development, `false` for production
    - `CHECK_INTERVAL_MINUTES`: How often to check for new turns (default: 3)
    - `ENVIRONMENT`: Deployment environment name (optional, defaults to "none")
+   - `MASTER_API_KEY`: Master key for generating API keys (auto-generated if not set)
 
 ### Running the Server
 
@@ -56,13 +58,47 @@ The server will:
 - Begin checking all registered users every few minutes
 - Send push notifications automatically when new turns are detected
 
+## API Authentication
+
+All protected endpoints require API key authentication using the `X-API-Key` header.
+
+### Generate API Key
+
+To generate an API key for a user:
+
+```bash
+POST /generate-api-key
+Content-Type: application/json
+
+{
+  "user_id": "your_ogs_user_id",
+  "master_key": "master_key_from_server_logs",
+  "description": "iOS App - Device Name"
+}
+```
+
+Response:
+```json
+{
+  "api_key": "64-character-hex-api-key",
+  "user_id": "1783478",
+  "created_at": "2025-09-22T14:30:00Z",
+  "description": "iOS App - Device Name"
+}
+```
+
+**Note**: The master key is logged when the server starts. Set `MASTER_API_KEY` environment variable to use a persistent key.
+
 ## API Endpoints
 
-### Register a Device Token
+All endpoints below require the `X-API-Key` header for authentication.
+
+### Register a Device Token (Protected)
 
 ```bash
 POST /register
 Content-Type: application/json
+X-API-Key: your-api-key
 
 {
   "user_id": "your_ogs_user_id",
@@ -70,26 +106,29 @@ Content-Type: application/json
 }
 ```
 
-### Manual Turn Check (Optional)
+### Manual Turn Check (Protected)
 
 ```bash
 GET /check/:user_id
+X-API-Key: your-api-key
 ```
 
 Returns JSON with current game status and sends notifications if needed.
 
-### User Diagnostics
+### User Diagnostics (Protected)
 
 ```bash
 GET /diagnostics/:user_id
+X-API-Key: your-api-key
 ```
 
 Returns comprehensive user status including device registration, monitored games, and last notification time.
 
-### Find Users by Device Token
+### Find Users by Device Token (Protected)
 
 ```bash
 GET /users-by-token/:device_token
+X-API-Key: your-api-key
 ```
 
 Returns all user IDs that are registered to a specific device token. Useful for iOS apps to discover which OGS users are monitored on the current device.

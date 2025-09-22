@@ -100,6 +100,7 @@ var apnsClient *apns2.Client
 
 func main() {
 	loadStorage()
+	loadAPIKeys()
 	initAPNS()
 
 	// Start periodic checking in background
@@ -107,14 +108,29 @@ func main() {
 
 	r := mux.NewRouter()
 
-	r.HandleFunc("/check/{userID}", checkUserTurn).Methods("GET")
-	r.HandleFunc("/register", registerDevice).Methods("POST")
-	r.HandleFunc("/users-by-token/{deviceToken}", getUsersByDeviceToken).Methods("GET")
+	// Public endpoints (no authentication required)
 	r.HandleFunc("/health", healthCheck).Methods("GET")
-	r.HandleFunc("/diagnostics/{userID}", getUserDiagnostics).Methods("GET")
+	r.HandleFunc("/generate-api-key", generateAPIKeyHandler).Methods("POST")
+
+	// Protected endpoints (require API key)
+	r.HandleFunc("/check/{userID}", requireAPIKey(checkUserTurn)).Methods("GET")
+	r.HandleFunc("/register", requireAPIKey(registerDevice)).Methods("POST")
+	r.HandleFunc("/users-by-token/{deviceToken}", requireAPIKey(getUsersByDeviceToken)).Methods("GET")
+	r.HandleFunc("/diagnostics/{userID}", requireAPIKey(getUserDiagnostics)).Methods("GET")
 
 	log.Println("Server starting on :8080")
 	log.Println("Automatic turn checking enabled")
+
+	// Log master key info on startup
+	masterKey := os.Getenv("MASTER_API_KEY")
+	if masterKey == "" {
+		newMasterKey, _ := generateAPIKey()
+		log.Printf("WARNING: No MASTER_API_KEY set. Generated temporary key: %s", newMasterKey)
+		log.Printf("Set this as MASTER_API_KEY environment variable to persist it")
+		os.Setenv("MASTER_API_KEY", newMasterKey)
+	} else {
+		log.Println("Master API key is configured")
+	}
 	log.Fatal(http.ListenAndServe(":8080", r))
 }
 
